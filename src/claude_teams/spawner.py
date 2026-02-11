@@ -230,12 +230,15 @@ def spawn_teammate(
         )
         pane_id = result.stdout.strip()
 
-        config = teams.read_config(team_name, base_dir)
-        for m in config.members:
-            if isinstance(m, TeammateMember) and m.name == name:
-                m.tmux_pane_id = pane_id
-                break
-        teams.write_config(team_name, config, base_dir)
+        # Auto-tile panes so all workers are visible side by side
+        if not use_tmux_windows():
+            subprocess.run(
+                ["tmux", "select-layout", "tiled"],
+                capture_output=True,
+                check=False,
+            )
+
+        teams.set_member_tmux_pane(team_name, name, pane_id, base_dir=base_dir)
     except Exception:
         if member_added:
             try:

@@ -296,8 +296,8 @@ class TestSpawnTeammateBackendType:
             backend_type="claude",
         )
         assert member.backend_type == "claude"
-        call_args = mock_subprocess.run.call_args[0][0]
-        cmd_str = call_args[-1]
+        spawn_call_args = mock_subprocess.run.call_args_list[0][0][0]
+        cmd_str = spawn_call_args[-1]
         assert "CLAUDECODE=1" in cmd_str
         assert "--agent-id" in cmd_str
 
@@ -321,8 +321,8 @@ class TestSpawnTeammateBackendType:
         )
         assert member.backend_type == "opencode"
         assert member.opencode_session_id == "ses_test123"
-        call_args = mock_subprocess.run.call_args[0][0]
-        cmd_str = call_args[-1]
+        spawn_call_args = mock_subprocess.run.call_args_list[0][0][0]
+        cmd_str = spawn_call_args[-1]
         assert "attach" in cmd_str
         assert "ses_test123" in cmd_str
         assert "CLAUDECODE=1" not in cmd_str

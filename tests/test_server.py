@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from pathlib import Path
@@ -89,6 +90,18 @@ class TestErrorPropagation:
             raise_on_error=False,
         )
         assert result.is_error is True
+
+    async def test_should_reject_team_create_when_name_exists_on_disk(
+        self, client: Client
+    ):
+        teams.create_team("already-there", "external-session")
+        result = await client.call_tool(
+            "team_create", {"team_name": "already-there"}, raise_on_error=False
+        )
+        assert result.is_error is True
+        assert "already exists" in result.content[0].text.lower()
+        cfg = teams.read_config("already-there")
+        assert cfg.lead_session_id == "external-session"
 
 
 class TestDeletedTaskGuard:
@@ -328,6 +341,46 @@ class TestWiring:
         assert len(inbox) == 1
         assert inbox[0]["from"] == "worker"
         assert inbox[0]["text"] == "done"
+
+    async def test_should_keep_routing_valid_during_concurrent_spawn_and_message(
+        self, client: Client, monkeypatch
+    ):
+        await client.call_tool("team_create", {"team_name": "t_race"})
+        teams.add_member("t_race", _make_teammate("worker0", "t_race"))
+
+        def _fake_spawn_teammate(**kwargs):
+            member = _make_teammate(kwargs["name"], kwargs["team_name"], pane_id="%88")
+            teams.add_member(kwargs["team_name"], member)
+            return member
+
+        monkeypatch.setattr("claude_teams.server.spawn_teammate", _fake_spawn_teammate)
+
+        spawn_task = client.call_tool(
+            "spawn_teammate",
+            {
+                "team_name": "t_race",
+                "name": "worker1",
+                "prompt": "do work",
+            },
+        )
+        msg_task = client.call_tool(
+            "send_message",
+            {
+                "team_name": "t_race",
+                "type": "message",
+                "recipient": "worker0",
+                "content": "ping",
+                "summary": "status",
+            },
+        )
+        spawn_result, msg_result = await asyncio.gather(spawn_task, msg_task)
+        assert spawn_result.is_error is False
+        assert msg_result.is_error is False
+
+        cfg = teams.read_config("t_race")
+        names = {m.name for m in cfg.members}
+        assert "worker0" in names
+        assert "worker1" in names
 
 
 class TestTeamDeleteClearsSession:

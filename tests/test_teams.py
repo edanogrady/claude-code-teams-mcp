@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import time
 import unittest.mock
@@ -81,6 +82,21 @@ class TestCreateTeam:
         result = create_team("a" * 64, "sess-x", base_dir=tmp_claude_dir)
         assert result.team_name == "a" * 64
 
+    def test_should_reject_existing_team_without_overwriting_config(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        create_team("dupe", "sess-1", base_dir=tmp_claude_dir)
+        add_member("dupe", _make_teammate("worker", "dupe"), base_dir=tmp_claude_dir)
+
+        config_path = tmp_claude_dir / "teams" / "dupe" / "config.json"
+        before = config_path.read_text()
+
+        with pytest.raises(FileExistsError, match="already exists"):
+            create_team("dupe", "sess-2", description="new", base_dir=tmp_claude_dir)
+
+        after = config_path.read_text()
+        assert after == before
+
 
 class TestDeleteTeam:
     def test_delete_team_removes_directories(self, tmp_claude_dir: Path) -> None:
@@ -120,6 +136,28 @@ class TestMembers:
         cfg = read_config("squad2", base_dir=tmp_claude_dir)
         assert len(cfg.members) == 1
         assert cfg.members[0].name == "team-lead"
+
+    def test_should_not_lose_members_under_concurrent_add_member(
+        self, tmp_claude_dir: Path
+    ) -> None:
+        create_team("race", "sess-1", base_dir=tmp_claude_dir)
+
+        def _add(i: int) -> None:
+            add_member(
+                "race",
+                _make_teammate(f"worker-{i}", "race"),
+                base_dir=tmp_claude_dir,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_add, range(24)))
+
+        cfg = read_config("race", base_dir=tmp_claude_dir)
+        names = {m.name for m in cfg.members}
+        assert len(names) == 25
+        assert "team-lead" in names
+        for i in range(24):
+            assert f"worker-{i}" in names
 
 
 class TestDuplicateMember:

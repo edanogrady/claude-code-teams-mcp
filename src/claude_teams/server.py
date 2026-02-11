@@ -244,9 +244,12 @@ def team_create(
         raise ToolError(
             f"Session already has active team: {ls['active_team']}. One team per session."
         )
-    result = teams.create_team(
-        name=team_name, session_id=ls["session_id"], description=description
-    )
+    try:
+        result = teams.create_team(
+            name=team_name, session_id=ls["session_id"], description=description
+        )
+    except (ValueError, FileExistsError) as e:
+        raise ToolError(str(e))
     ls["active_team"] = team_name
     return result.model_dump()
 
