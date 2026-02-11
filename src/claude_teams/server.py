@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import time
 import uuid
 from types import SimpleNamespace
@@ -36,6 +37,14 @@ KNOWN_CLIENTS: dict[str, str] = {
     "claude-code": "claude",
     "claude": "claude",
     "opencode": "opencode",
+    "codex": "codex",
+    "openai-codex": "codex",
+    "codex-cli": "codex",
+    "codex-mcp-client": "codex",
+    "gemini": "gemini",
+    "gemini-cli": "gemini",
+    "gemini-cli-mcp-client": "gemini",
+    "google-gemini": "gemini",
 }
 
 # NOTE(victor): Mutated by both app_lifespan and HarnessDetectionMiddleware.
@@ -74,17 +83,27 @@ def _build_spawn_description(
     opencode_server_url: str | None = None,
     opencode_agents: list[dict] | None = None,
     enabled_backends: list[str] | None = None,
+    codex_binary: str | None = None,
+    gemini_binary: str | None = None,
 ) -> str:
     tmux_target = "window" if use_tmux_windows() else "pane"
     parts = [_SPAWN_TOOL_BASE_DESCRIPTION.format(target=tmux_target)]
     backends = []
     show_claude = claude_binary is not None
     show_opencode = opencode_binary is not None and opencode_server_url is not None
+    show_codex = codex_binary is not None
+    show_gemini = gemini_binary is not None
     if enabled_backends is not None:
         show_claude = show_claude and "claude" in enabled_backends
         show_opencode = show_opencode and "opencode" in enabled_backends
+        show_codex = show_codex and "codex" in enabled_backends
+        show_gemini = show_gemini and "gemini" in enabled_backends
     if show_claude:
-        backends.append("'claude' (default, models: sonnet, opus, haiku)")
+        backends.append("'claude' (models: sonnet, opus, haiku)")
+    if show_codex:
+        backends.append("'codex' (interactive Codex CLI in tmux, default model: gpt-5.3-codex)")
+    if show_gemini:
+        backends.append("'gemini' (interactive Gemini CLI in tmux, default model: gemini-3-pro-preview)")
     if show_opencode:
         model_list = (
             ", ".join(opencode_models) if opencode_models else "none discovered"
@@ -112,6 +131,8 @@ def _update_spawn_tool(tool, enabled: list[str], state: dict[str, Any]) -> None:
         state.get("opencode_server_url"),
         state.get("opencode_agents"),
         enabled_backends=enabled,
+        codex_binary=state.get("codex_binary"),
+        gemini_binary=state.get("gemini_binary"),
     )
 
 
@@ -121,10 +142,15 @@ async def app_lifespan(server):
 
     claude_binary = discover_harness_binary("claude")
     opencode_binary = discover_harness_binary("opencode")
-    if not claude_binary and not opencode_binary:
+    codex_binary = discover_harness_binary("codex")
+    gemini_binary = discover_harness_binary("gemini")
+
+    any_binary = claude_binary or opencode_binary or codex_binary or gemini_binary
+    if not any_binary:
         raise FileNotFoundError(
             "No coding agent binary found on PATH. "
-            "Install Claude Code ('claude') or OpenCode ('opencode')."
+            "Install Claude Code ('claude'), Codex CLI ('codex'), "
+            "Gemini CLI ('gemini'), or OpenCode ('opencode')."
         )
     opencode_server_url = os.environ.get("OPENCODE_SERVER_URL")
     opencode_models: list[str] = []
@@ -142,32 +168,38 @@ async def app_lifespan(server):
     enabled_backends = _parse_backends_env(os.environ.get("CLAUDE_TEAMS_BACKENDS", ""))
     if "opencode" in enabled_backends and not opencode_server_url:
         enabled_backends.remove("opencode")
+    # Codex and gemini only need their binary — no server URL required
+    if "codex" in enabled_backends and not codex_binary:
+        enabled_backends.remove("codex")
+    if "gemini" in enabled_backends and not gemini_binary:
+        enabled_backends.remove("gemini")
+
+    state = {
+        "claude_binary": claude_binary,
+        "opencode_binary": opencode_binary,
+        "codex_binary": codex_binary,
+        "gemini_binary": gemini_binary,
+        "opencode_models": opencode_models,
+        "opencode_server_url": opencode_server_url,
+        "opencode_agents": opencode_agents,
+    }
 
     tool = await mcp.get_tool("spawn_teammate")
     _spawn_tool = tool
 
     if enabled_backends:
-        _update_spawn_tool(tool, enabled_backends, {
-            "claude_binary": claude_binary,
-            "opencode_binary": opencode_binary,
-            "opencode_models": opencode_models,
-            "opencode_server_url": opencode_server_url,
-            "opencode_agents": opencode_agents,
-        })
+        _update_spawn_tool(tool, enabled_backends, state)
     else:
         tool.description = _build_spawn_description(
             claude_binary, opencode_binary, opencode_models,
             opencode_server_url, opencode_agents,
+            codex_binary=codex_binary, gemini_binary=gemini_binary,
         )
 
     session_id = str(uuid.uuid4())
     _lifespan_state.clear()
     _lifespan_state.update({
-        "claude_binary": claude_binary,
-        "opencode_binary": opencode_binary,
-        "opencode_server_url": opencode_server_url,
-        "opencode_agents": opencode_agents,
-        "opencode_models": opencode_models,
+        **state,
         "enabled_backends": enabled_backends,
         "session_id": session_id,
         "active_team": None,
@@ -196,12 +228,22 @@ class HarnessDetectionMiddleware(Middleware):
         enabled = _lifespan_state.get("enabled_backends", [])
 
         if native_backend and native_backend not in enabled:
-            if native_backend == "claude" or _lifespan_state.get("opencode_server_url"):
+            if native_backend == "claude" and _lifespan_state.get("claude_binary"):
+                enabled.append(native_backend)
+            elif native_backend == "codex" and _lifespan_state.get("codex_binary"):
+                enabled.append(native_backend)
+            elif native_backend == "gemini" and _lifespan_state.get("gemini_binary"):
+                enabled.append(native_backend)
+            elif native_backend == "opencode" and _lifespan_state.get("opencode_server_url"):
                 enabled.append(native_backend)
 
         if not enabled:
             if _lifespan_state.get("claude_binary"):
                 enabled.append("claude")
+            if _lifespan_state.get("codex_binary"):
+                enabled.append("codex")
+            if _lifespan_state.get("gemini_binary"):
+                enabled.append("gemini")
             if _lifespan_state.get("opencode_binary") and _lifespan_state.get("opencode_server_url"):
                 enabled.append("opencode")
 
@@ -272,10 +314,10 @@ def spawn_teammate_tool(
     name: str,
     prompt: str,
     ctx: Context,
-    model: str = "sonnet",
+    model: str = "",
     subagent_type: str = "general-purpose",
     plan_mode_required: bool = False,
-    backend_type: Literal["claude", "opencode"] = "claude",
+    backend_type: Literal["claude", "codex", "gemini", "opencode"] = "claude",
 ) -> dict:
     """Spawn a new teammate in tmux. Description is dynamically updated
     at startup with available backends and models."""
@@ -292,17 +334,19 @@ def spawn_teammate_tool(
             team_name=team_name,
             name=name,
             prompt=prompt,
-            claude_binary=ls["claude_binary"],
+            claude_binary=ls.get("claude_binary"),
             lead_session_id=ls["session_id"],
             model=model,
             subagent_type=subagent_type,
             plan_mode_required=plan_mode_required,
             backend_type=backend_type,
-            opencode_binary=ls["opencode_binary"],
-            opencode_server_url=ls["opencode_server_url"],
+            opencode_binary=ls.get("opencode_binary"),
+            opencode_server_url=ls.get("opencode_server_url"),
             opencode_agent=opencode_agent,
+            codex_binary=ls.get("codex_binary"),
+            gemini_binary=ls.get("gemini_binary"),
         )
-    except (ValueError, OpenCodeAPIError) as e:
+    except (ValueError, OpenCodeAPIError, subprocess.CalledProcessError) as e:
         raise ToolError(str(e))
     return SpawnResult(
         agent_id=member.agent_id,
@@ -485,6 +529,8 @@ def send_message(
         ).model_dump(exclude_none=True)
 
     elif type == "shutdown_response":
+        if approve is None:
+            raise ToolError("Error: 'approve' parameter is required (true or false)")
         config = teams.read_config(team_name)
         member = None
         for m in config.members:
@@ -527,6 +573,8 @@ def send_message(
             ).model_dump(exclude_none=True)
 
     elif type == "plan_approval_response":
+        if approve is None:
+            raise ToolError("Error: 'approve' parameter is required (true or false)")
         if not recipient:
             raise ToolError("Plan approval recipient must not be empty")
         config = teams.read_config(team_name)
@@ -680,7 +728,12 @@ def force_kill_teammate(team_name: str, agent_name: str, ctx: Context) -> dict:
     send_message(type='shutdown_request') is not possible or not responding.
     Kills the tmux pane/window, removes member from config, and resets their tasks."""
     oc_url = _get_lifespan(ctx).get("opencode_server_url")
-    config = teams.read_config(team_name)
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    except ValueError as e:
+        raise ToolError(f"Failed to read team config for {team_name!r}: {e}")
     member = None
     for m in config.members:
         if isinstance(m, TeammateMember) and m.name == agent_name:
@@ -692,8 +745,13 @@ def force_kill_teammate(team_name: str, agent_name: str, ctx: Context) -> dict:
         _cleanup_opencode_session(oc_url, member.opencode_session_id)
     if member.tmux_pane_id:
         kill_tmux_pane(member.tmux_pane_id)
-    teams.remove_member(team_name, agent_name)
-    tasks.reset_owner_tasks(team_name, agent_name)
+    try:
+        teams.remove_member(team_name, agent_name)
+        tasks.reset_owner_tasks(team_name, agent_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    except ValueError as e:
+        raise ToolError(f"Failed to stop teammate {agent_name!r}: {e}")
     return {"success": True, "message": f"{agent_name} has been stopped."}
 
 
@@ -706,17 +764,33 @@ async def poll_inbox(
     """Poll an agent's inbox for new unread messages, waiting up to timeout_ms.
     Returns unread messages and marks them as read. Convenience tool for MCP
     clients that cannot watch the filesystem."""
-    msgs = messaging.read_inbox(
-        team_name, agent_name, unread_only=True, mark_as_read=True
-    )
+    try:
+        config = teams.read_config(team_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    except ValueError as e:
+        raise ToolError(f"Failed to read team config for {team_name!r}: {e}")
+    member_names = {m.name for m in config.members}
+    if agent_name not in member_names:
+        raise ToolError(f"Agent {agent_name!r} is not a member of team {team_name!r}")
+
+    try:
+        msgs = messaging.read_inbox(
+            team_name, agent_name, unread_only=True, mark_as_read=True
+        )
+    except ValueError as e:
+        raise ToolError(f"Failed to read inbox for agent {agent_name!r}: {e}")
     if msgs:
         return [m.model_dump(by_alias=True, exclude_none=True) for m in msgs]
     deadline = time.time() + timeout_ms / 1000.0
     while time.time() < deadline:
         await asyncio.sleep(0.5)
-        msgs = messaging.read_inbox(
-            team_name, agent_name, unread_only=True, mark_as_read=True
-        )
+        try:
+            msgs = messaging.read_inbox(
+                team_name, agent_name, unread_only=True, mark_as_read=True
+            )
+        except ValueError as e:
+            raise ToolError(f"Failed to read inbox for agent {agent_name!r}: {e}")
         if msgs:
             return [m.model_dump(by_alias=True, exclude_none=True) for m in msgs]
     return []
@@ -729,15 +803,25 @@ def process_shutdown_approved(team_name: str, agent_name: str, ctx: Context) -> 
     if agent_name == "team-lead":
         raise ToolError("Cannot process shutdown for team-lead")
     oc_url = _get_lifespan(ctx).get("opencode_server_url")
-    member = _find_teammate(team_name, agent_name)
+    try:
+        member = _find_teammate(team_name, agent_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    except ValueError as e:
+        raise ToolError(f"Failed to read team config for {team_name!r}: {e}")
     if member is None:
         raise ToolError(f"Teammate {agent_name!r} not found in team {team_name!r}")
     if member.backend_type == "opencode" and member.opencode_session_id:
         _cleanup_opencode_session(oc_url, member.opencode_session_id)
     if member.tmux_pane_id:
         kill_tmux_pane(member.tmux_pane_id)
-    teams.remove_member(team_name, agent_name)
-    tasks.reset_owner_tasks(team_name, agent_name)
+    try:
+        teams.remove_member(team_name, agent_name)
+        tasks.reset_owner_tasks(team_name, agent_name)
+    except FileNotFoundError:
+        raise ToolError(f"Team {team_name!r} not found")
+    except ValueError as e:
+        raise ToolError(f"Failed to process shutdown for {agent_name!r}: {e}")
     return {"success": True, "message": f"{agent_name} removed from team."}
 
 
